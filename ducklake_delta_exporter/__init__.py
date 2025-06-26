@@ -1,4 +1,4 @@
-# File: ducklake_delta_exporter.py
+# File: __init__.py
 import os
 import json
 import uuid
