@@ -14,7 +14,7 @@ setup(
     description='A utility to export DuckLake database metadata to Delta Lake transaction logs.',
     long_description=open('README.md').read(),
     long_description_content_type='text/markdown',
-    url='https://github.com/yourusername/ducklake-delta-exporter',
+    url='https://github.com/djouallah/ducklake-delta-exporter',
     classifiers=[
         'Programming Language :: Python :: 3',
         'License :: OSI Approved :: MIT License',
