@@ -18,6 +18,7 @@ pip install ducklake-delta-exporter
 
 
 # Usage
-
+```
 from ducklake_delta_exporter import generate_latest_delta_log
 generate_latest_delta_log('path/to/your/ducklake.db', data_root='/lakehouse/default/Tables', checkpoint_interval=1)
+```
