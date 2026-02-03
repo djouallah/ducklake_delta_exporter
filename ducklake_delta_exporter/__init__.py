@@ -1,324 +1,487 @@
 # File: ducklake_delta_exporter.py
-import json
-import time
 import duckdb
 
-def map_type_ducklake_to_spark(t):
-    """Maps DuckDB data types to their Spark SQL equivalents for the Delta schema."""
-    t = t.lower()
-    if 'int' in t:
-        return 'long' if '64' in t else 'integer'
-    elif 'float' in t:
-        return 'double'
-    elif 'double' in t:
-        return 'double'
-    elif 'decimal' in t:
-        return 'decimal(10,0)'
-    elif 'bool' in t:
-        return 'boolean'
-    elif 'timestamp' in t:
-        return 'timestamp'
-    elif 'date' in t:
-        return 'date'
-    return 'string'
 
-def create_spark_schema_string(fields):
-    """Creates a JSON string for the Spark schema from a list of fields."""
-    return json.dumps({"type": "struct", "fields": fields})
+def generate_latest_delta_log(db_path: str):
+    """
+    Export the latest DuckLake snapshot for each table as Delta checkpoint files.
+    Uses DuckDB 1.4.4+ native support for writing to abfss://, s3://, etc.
 
-def get_latest_ducklake_snapshot(con, table_id):
-    """
-    Get the latest DuckLake snapshot ID for a table.
-    """
-    latest_snapshot  = con.execute(f""" SELECT MAX(begin_snapshot) as latest_snapshot FROM ducklake_data_file  WHERE table_id = {table_id} """).fetchone()[0]
-    return latest_snapshot
-
-def get_latest_delta_checkpoint(con, table_id):
-    """
-    check how many times a table has being modified.
-    """
-    delta_checkpoint = con.execute(f""" SELECT count(snapshot_id) FROM ducklake_snapshot_changes
-                                   where changes_made like '%:{table_id}' or changes_made like '%:{table_id},%' """).fetchone()[0]
-    return delta_checkpoint
-
-def get_file_modification_time(dummy_time):
-    """
-    Return a dummy modification time for parquet files.
-    This avoids the latency of actually reading file metadata.
-    
     Args:
-        dummy_time: Timestamp in milliseconds to use as modification time
-    
-    Returns:
-        Modification time in milliseconds
+        db_path (str): The path to the DuckLake database file (or connection string).
     """
-    return dummy_time
+    # For remote paths (abfss://, s3://, etc.), use in-memory connection with ATTACH
+    is_remote = any(db_path.startswith(prefix) for prefix in ['abfss://', 's3://', 'gs://', 'az://', 'http://', 'https://'])
 
-def create_dummy_json_log(table_root, delta_version, table_info, schema_fields, now):
-    """
-    Create a minimal JSON log file for Spark compatibility using DuckDB.
-    """
-    json_log_file = table_root + f"_delta_log/{delta_version:020d}.json"
-    
-    # Create JSON log entries using DuckDB
-    duckdb.execute("DROP TABLE IF EXISTS json_log_table")
-    
-    # Protocol entry
-    protocol_json = json.dumps({
-        "protocol": {
-            "minReaderVersion": 1,
-            "minWriterVersion": 2
-        }
-    })
-    
-    # Metadata entry
-    metadata_json = json.dumps({
-        "metaData": {
-            "id": str(table_info['table_id']),
-            "name": table_info['table_name'],
-            "description": None,
-            "format": {
-                "provider": "parquet",
-                "options": {}
-            },
-            "schemaString": create_spark_schema_string(schema_fields),
-            "partitionColumns": [],
-            "createdTime": now,
-            "configuration": {
-                "delta.logRetentionDuration": "interval 1 hour"
-            }
-        }
-    })
-    
-    # Commit info entry
-    commitinfo_json = json.dumps({
-        "commitInfo": {
-            "timestamp": now,
-            "operation": "CONVERT",
-            "operationParameters": {
-                "convertedFrom": "DuckLake"
-            },
-            "isBlindAppend": True,
-            "engineInfo": "DuckLake-Delta-Exporter",
-            "clientVersion": "1.0.0"
-        }
-    })
-    
-    # Create table with JSON entries
-    duckdb.execute("""
-        CREATE TABLE json_log_table AS
-        SELECT ? AS json_line
-        UNION ALL
-        SELECT ? AS json_line
-        UNION ALL
-        SELECT ? AS json_line
-    """, [protocol_json, metadata_json, commitinfo_json])
-    
-    # Write JSON log file using DuckDB
-    duckdb.execute(f"COPY (SELECT json_line FROM json_log_table) TO '{json_log_file}' (FORMAT CSV, HEADER false, QUOTE '')")
-    
-    # Clean up
-    duckdb.execute("DROP TABLE IF EXISTS json_log_table")
-    
-    return json_log_file
+    if is_remote:
+        con = duckdb.connect()
+        # Load required extensions for cloud storage
+        if db_path.startswith('abfss://') or db_path.startswith('az://'):
+            con.execute("LOAD azure")
+            # Load persistent secrets
+            con.execute("SELECT * FROM duckdb_secrets()")
+        elif db_path.startswith('s3://'):
+            con.execute("LOAD httpfs")
+        con.execute(f"ATTACH '{db_path}' AS ducklake_db (READ_ONLY)")
+        con.execute("USE ducklake_db")
+    else:
+        con = duckdb.connect(db_path, read_only=True)
 
-def build_file_path(table_root, relative_path):
-    """
-    Build full file path from table root and relative path.
-    Works with both local paths and S3 URLs.
-    """
-    table_root = table_root.rstrip('/')
-    relative_path = relative_path.lstrip('/')
-    return f"{table_root}/{relative_path}"
+    # Build export summary - identify which tables have data
+    con.execute("""
+        CREATE OR REPLACE TEMP TABLE export_summary AS
+        WITH
+        data_root_config AS (
+            SELECT value AS data_root FROM ducklake_metadata WHERE key = 'data_path'
+        ),
+        active_tables AS (
+            SELECT
+                t.table_id,
+                t.table_name,
+                s.schema_name,
+                t.path AS table_path,
+                s.path AS schema_path,
+                rtrim((SELECT data_root FROM data_root_config), '/') || '/' ||
+                    CASE
+                        WHEN trim(s.path, '/') != '' THEN trim(s.path, '/') || '/'
+                        ELSE ''
+                    END ||
+                    trim(t.path, '/') AS table_root
+            FROM ducklake_table t
+            JOIN ducklake_schema s USING(schema_id)
+            WHERE t.end_snapshot IS NULL
+        ),
+        current_snapshot AS (
+            SELECT MAX(snapshot_id) AS snapshot_id FROM ducklake_snapshot
+        ),
+        table_last_modified AS (
+            SELECT
+                t.*,
+                COALESCE(
+                    (SELECT MAX(sc.snapshot_id)
+                     FROM ducklake_snapshot_changes sc
+                     WHERE regexp_matches(sc.changes_made, '[:,]' || t.table_id || '([^0-9]|$)')
+                    ),
+                    (SELECT cs.snapshot_id
+                     FROM current_snapshot cs
+                     WHERE EXISTS (
+                         SELECT 1 FROM ducklake_data_file df
+                         WHERE df.table_id = t.table_id
+                           AND df.end_snapshot IS NULL
+                     )
+                    )
+                ) AS last_modified_snapshot,
+                (SELECT COUNT(*) FROM ducklake_data_file df
+                 WHERE df.table_id = t.table_id
+                   AND df.end_snapshot IS NULL
+                ) AS file_count
+            FROM active_tables t
+        )
+        SELECT
+            table_id,
+            schema_name,
+            table_name,
+            table_root,
+            CASE
+                WHEN file_count = 0 THEN 'no_data_files'
+                WHEN last_modified_snapshot IS NULL THEN 'no_changes'
+                ELSE 'needs_export'
+            END AS status,
+            last_modified_snapshot AS snapshot_id,
+            file_count
+        FROM table_last_modified
+    """)
 
-def create_checkpoint_for_latest_snapshot(con, table_info, data_root):
-    """
-    Create a Delta checkpoint file for the latest DuckLake snapshot.
-    """
-    table_root = data_root.rstrip('/') + '/' + table_info['schema_path'] + table_info['table_path']
-    
-    # Get the latest snapshot
-    latest_snapshot = get_latest_ducklake_snapshot(con, table_info['table_id'])
-    if latest_snapshot is None:
-        print(f"⚠️ {table_info['schema_name']}.{table_info['table_name']}: No snapshots found")
-        return False
-    delta_version   = get_latest_delta_checkpoint(con, table_info['table_id'])
-    checkpoint_file = table_root + f"_delta_log/{delta_version:020d}.checkpoint.parquet"
-    json_log_file   = table_root + f"_delta_log/{delta_version:020d}.json"
-    
-    try:
-        con.execute(f"SELECT protocol FROM '{checkpoint_file}' limit 0 ")
-        print(f"⚠️ {table_info['schema_name']}.{table_info['table_name']}: Checkpoint file already exists: {checkpoint_file}")
-    except:
-    
-        now = int(time.time() * 1000)
-        
-        # Get all files for the latest snapshot
-        file_rows = con.execute(f"""
-            SELECT path, file_size_bytes FROM ducklake_data_file
-            WHERE table_id = {table_info['table_id']}
-            AND begin_snapshot <= {latest_snapshot} 
-            AND (end_snapshot IS NULL OR end_snapshot > {latest_snapshot})
-        """).fetchall()
-        
-        # Get schema for the latest snapshot
-        columns = con.execute(f"""
-            SELECT column_name, column_type FROM ducklake_column
-            WHERE table_id = {table_info['table_id']}
-            AND begin_snapshot <= {latest_snapshot} 
-            AND (end_snapshot IS NULL OR end_snapshot > {latest_snapshot})
-            ORDER BY column_order
-        """).fetchall()
-        
-        # Get or generate table metadata ID
-        table_meta_id = str(table_info['table_id'])
-        
-        # Prepare schema
-        schema_fields = [
-            {"name": name, "type": map_type_ducklake_to_spark(typ), "nullable": True, "metadata": {}} 
-            for name, typ in columns
-        ]
-        
-        # Create checkpoint data using DuckDB directly
-        checkpoint_data = []
-        
-        # Create checkpoint data directly in DuckDB using proper data types
-        duckdb.execute("DROP TABLE IF EXISTS checkpoint_table")
-        
-        # Create the checkpoint table with proper nested structure
-        duckdb.execute("""
-            CREATE TABLE checkpoint_table AS
-            WITH checkpoint_data AS (
-                -- Protocol record
-                SELECT 
-                    {'minReaderVersion': 1, 'minWriterVersion': 2}::STRUCT(minReaderVersion INTEGER, minWriterVersion INTEGER) AS protocol,
-                    NULL::STRUCT(id VARCHAR, name VARCHAR, description VARCHAR, format STRUCT(provider VARCHAR, options MAP(VARCHAR, VARCHAR)), schemaString VARCHAR, partitionColumns VARCHAR[], createdTime BIGINT, configuration MAP(VARCHAR, VARCHAR)) AS metaData,
-                    NULL::STRUCT(path VARCHAR, partitionValues MAP(VARCHAR, VARCHAR), size BIGINT, modificationTime BIGINT, dataChange BOOLEAN, stats VARCHAR, tags MAP(VARCHAR, VARCHAR)) AS add,
-                    NULL::STRUCT(path VARCHAR, deletionTimestamp BIGINT, dataChange BOOLEAN) AS remove,
-                    NULL::STRUCT(timestamp TIMESTAMP, operation VARCHAR, operationParameters MAP(VARCHAR, VARCHAR), isBlindAppend BOOLEAN, engineInfo VARCHAR, clientVersion VARCHAR) AS commitInfo
-                
-                UNION ALL
-                
-                -- Metadata record
-                SELECT 
-                    NULL::STRUCT(minReaderVersion INTEGER, minWriterVersion INTEGER) AS protocol,
-                    {
-                        'id': ?, 
-                        'name': ?, 
-                        'description': NULL, 
-                        'format': {'provider': 'parquet', 'options': MAP{}}::STRUCT(provider VARCHAR, options MAP(VARCHAR, VARCHAR)),
-                        'schemaString': ?, 
-                        'partitionColumns': []::VARCHAR[], 
-                        'createdTime': ?, 
-                        'configuration': MAP{'delta.logRetentionDuration': 'interval 1 hour'}
-                    }::STRUCT(id VARCHAR, name VARCHAR, description VARCHAR, format STRUCT(provider VARCHAR, options MAP(VARCHAR, VARCHAR)), schemaString VARCHAR, partitionColumns VARCHAR[], createdTime BIGINT, configuration MAP(VARCHAR, VARCHAR)) AS metaData,
-                    NULL::STRUCT(path VARCHAR, partitionValues MAP(VARCHAR, VARCHAR), size BIGINT, modificationTime BIGINT, dataChange BOOLEAN, stats VARCHAR, tags MAP(VARCHAR, VARCHAR)) AS add,
-                    NULL::STRUCT(path VARCHAR, deletionTimestamp BIGINT, dataChange BOOLEAN) AS remove,
-                    NULL::STRUCT(timestamp TIMESTAMP, operation VARCHAR, operationParameters MAP(VARCHAR, VARCHAR), isBlindAppend BOOLEAN, engineInfo VARCHAR, clientVersion VARCHAR) AS commitInfo
-            )
-            SELECT * FROM checkpoint_data
-        """, [table_meta_id, table_info['table_name'], create_spark_schema_string(schema_fields), now])
-        
-        # Add file records
-        for path, size in file_rows:
-            rel_path = path.lstrip('/')
-            full_path = build_file_path(table_root, rel_path)
-            mod_time = get_file_modification_time(now)
-            
-            duckdb.execute("""
-                INSERT INTO checkpoint_table
-                SELECT 
-                    NULL::STRUCT(minReaderVersion INTEGER, minWriterVersion INTEGER) AS protocol,
-                    NULL::STRUCT(id VARCHAR, name VARCHAR, description VARCHAR, format STRUCT(provider VARCHAR, options MAP(VARCHAR, VARCHAR)), schemaString VARCHAR, partitionColumns VARCHAR[], createdTime BIGINT, configuration MAP(VARCHAR, VARCHAR)) AS metaData,
-                    {
-                        'path': ?, 
-                        'partitionValues': MAP{}::MAP(VARCHAR, VARCHAR), 
-                        'size': ?, 
-                        'modificationTime': ?, 
-                        'dataChange': true, 
-                        'stats': ?, 
-                        'tags': NULL::MAP(VARCHAR, VARCHAR)
-                    }::STRUCT(path VARCHAR, partitionValues MAP(VARCHAR, VARCHAR), size BIGINT, modificationTime BIGINT, dataChange BOOLEAN, stats VARCHAR, tags MAP(VARCHAR, VARCHAR)) AS add,
-                    NULL::STRUCT(path VARCHAR, deletionTimestamp BIGINT, dataChange BOOLEAN) AS remove,
-                    NULL::STRUCT(timestamp TIMESTAMP, operation VARCHAR, operationParameters MAP(VARCHAR, VARCHAR), isBlindAppend BOOLEAN, engineInfo VARCHAR, clientVersion VARCHAR) AS commitInfo
-            """, [rel_path, size, mod_time, json.dumps({"numRecords": None})])
-        
-        # Create the _delta_log directory if it doesn't exist
-        duckdb.execute(f"COPY (SELECT 43) TO '{table_root}_delta_log' (FORMAT PARQUET, PER_THREAD_OUTPUT, OVERWRITE_OR_IGNORE)")
-            
-        # Write the checkpoint file
-        duckdb.execute(f"COPY (SELECT * FROM checkpoint_table) TO '{checkpoint_file}' (FORMAT PARQUET)")
-        
-        # Create dummy JSON log file for Spark compatibility
-        create_dummy_json_log(table_root, delta_version, table_info, schema_fields, now)
-            
-        # Write the _last_checkpoint file
-        total_records = 2 + len(file_rows)  # protocol + metadata + file records
-        duckdb.execute(f"""
-            COPY (SELECT {delta_version} AS version, {total_records} AS size) 
-            TO '{table_root}_delta_log/_last_checkpoint' (FORMAT JSON, ARRAY false)
-        """)
-            
-        print(f"✅ Exported DuckLake snapshot {latest_snapshot} as Delta checkpoint v{delta_version}")
-        print(f"✅ Created JSON log file: {json_log_file}")
-        
-        # Clean up temporary tables
-        duckdb.execute("DROP TABLE IF EXISTS checkpoint_table")
-    
-    return True, delta_version, latest_snapshot
-
-def generate_latest_delta_log(db_path: str, data_root: str = None):
-    """
-    Export the latest DuckLake snapshot for each table as a Delta checkpoint file.
-    Creates both checkpoint files and minimal JSON log files for Spark compatibility.
-    
-    Args:
-        db_path (str): The path to the DuckLake database file.
-        data_root (str): The root directory for the lakehouse data.
-    """
-    con = duckdb.connect(db_path, read_only=True)
-    
-    if data_root is None:
-        data_root = con.sql("SELECT value FROM ducklake_metadata WHERE key = 'data_path'").fetchone()[0]
-    
-    # Get all active tables
-    tables = con.execute("""
-        SELECT 
-            t.table_id, 
-            t.table_name, 
-            s.schema_name,
-            t.path as table_path, 
-            s.path as schema_path
-        FROM ducklake_table t
-        JOIN ducklake_schema s USING(schema_id)
-        WHERE t.end_snapshot IS NULL
+    # Get tables that need export
+    tables_to_export = con.execute("""
+        SELECT table_id, schema_name, table_name, table_root, snapshot_id, file_count
+        FROM export_summary
+        WHERE status = 'needs_export'
     """).fetchall()
-    
-    total_tables = len(tables)
-    successful_exports = 0
-    
-    for table_row in tables:
-        table_info = {
-            'table_id': table_row[0],
-            'table_name': table_row[1],
-            'schema_name': table_row[2],
-            'table_path': table_row[3],
-            'schema_path': table_row[4]
-        }
-        
-        table_key = f"{table_info['schema_name']}.{table_info['table_name']}"
-        print(f"Processing {table_key}...")
-        
+
+    # Show summary
+    summary = con.execute("""
+        SELECT status, COUNT(*) as cnt FROM export_summary GROUP BY status
+    """).fetchall()
+
+    for status, cnt in summary:
+        print(f"  {status}: {cnt} tables")
+
+    if not tables_to_export:
+        print("\n✅ No tables need export.")
+        con.close()
+        return
+
+    print(f"\n📦 Exporting {len(tables_to_export)} tables...")
+
+    # Process each table
+    for table_id, schema_name, table_name, table_root, snapshot_id, file_count in tables_to_export:
+        table_key = f"{schema_name}.{table_name}"
+
+        # Check if checkpoint already exists for this snapshot
+        checkpoint_path = f"{table_root}/_delta_log/{snapshot_id:020d}.checkpoint.parquet"
         try:
-            result = create_checkpoint_for_latest_snapshot(con, table_info, data_root)
-            
-            if result:
-                successful_exports += 1
-            else:
-                print(f"⚠️ {table_key}: No data to export")
-                
+            con.execute(f"SELECT 1 FROM '{checkpoint_path}' LIMIT 1")
+            print(f"  ⏭️  {table_key}: snapshot {snapshot_id} already exported")
+            continue
+        except Exception:
+            pass  # File doesn't exist, proceed with export
+
+        print(f"\n  Processing {table_key}...")
+
+        try:
+            # Build checkpoint parquet data for this table
+            con.execute("""
+                CREATE OR REPLACE TEMP TABLE temp_checkpoint_parquet AS
+                WITH
+                table_schemas AS (
+                    SELECT
+                        ? AS table_id,
+                        ? AS table_name,
+                        ? AS snapshot_id,
+                        ? AS table_root,
+                        list({
+                            'name': c.column_name,
+                            'type':
+                                CASE
+                                    WHEN contains(lower(c.column_type), 'bigint') OR
+                                         (contains(lower(c.column_type), 'int') AND contains(c.column_type, '64')) THEN 'long'
+                                    WHEN contains(lower(c.column_type), 'int') THEN 'integer'
+                                    WHEN contains(lower(c.column_type), 'float') THEN 'double'
+                                    WHEN contains(lower(c.column_type), 'double') THEN 'double'
+                                    WHEN contains(lower(c.column_type), 'bool') THEN 'boolean'
+                                    WHEN contains(lower(c.column_type), 'timestamp') THEN 'timestamp'
+                                    WHEN contains(lower(c.column_type), 'date') THEN 'date'
+                                    WHEN contains(lower(c.column_type), 'decimal') THEN lower(c.column_type)
+                                    ELSE 'string'
+                                END,
+                            'nullable': true,
+                            'metadata': MAP{}::MAP(VARCHAR, VARCHAR)
+                        }::STRUCT(name VARCHAR, type VARCHAR, nullable BOOLEAN, metadata MAP(VARCHAR, VARCHAR)) ORDER BY c.column_order) AS schema_fields
+                    FROM ducklake_column c
+                    WHERE c.table_id = ?
+                      AND c.end_snapshot IS NULL
+                ),
+                file_column_stats_agg AS (
+                    SELECT
+                        df.data_file_id,
+                        c.column_name,
+                        ANY_VALUE(c.column_type) AS column_type,
+                        MAX(fcs.value_count) AS value_count,
+                        MIN(fcs.min_value) AS min_value,
+                        MAX(fcs.max_value) AS max_value,
+                        MAX(fcs.null_count) AS null_count
+                    FROM ducklake_data_file df
+                    LEFT JOIN ducklake_file_column_stats fcs ON df.data_file_id = fcs.data_file_id
+                    LEFT JOIN ducklake_column c ON fcs.column_id = c.column_id AND c.table_id = df.table_id
+                    WHERE df.table_id = ?
+                      AND df.end_snapshot IS NULL
+                      AND c.column_id IS NOT NULL
+                      AND c.end_snapshot IS NULL
+                    GROUP BY df.data_file_id, c.column_name
+                ),
+                file_column_stats_transformed AS (
+                    SELECT
+                        fca.data_file_id,
+                        fca.column_name,
+                        fca.column_type,
+                        fca.value_count,
+                        fca.null_count,
+                        CASE
+                            WHEN fca.min_value IS NULL THEN NULL
+                            WHEN contains(lower(fca.column_type), 'timestamp') THEN
+                                regexp_replace(
+                                    regexp_replace(replace(fca.min_value, ' ', 'T'), '[+-]\\d{2}(?::\\d{2})?$', ''),
+                                    '^([^.]+)$', '\\1.000'
+                                ) || 'Z'
+                            WHEN contains(lower(fca.column_type), 'date') THEN fca.min_value
+                            WHEN contains(lower(fca.column_type), 'bool') THEN CAST(lower(fca.min_value) IN ('true', 't', '1', 'yes') AS VARCHAR)
+                            WHEN contains(lower(fca.column_type), 'int') OR contains(lower(fca.column_type), 'float')
+                                 OR contains(lower(fca.column_type), 'double') OR contains(lower(fca.column_type), 'decimal') THEN
+                                CASE WHEN contains(fca.min_value, '.') OR contains(lower(fca.min_value), 'e')
+                                     THEN CAST(TRY_CAST(fca.min_value AS DOUBLE) AS VARCHAR)
+                                     ELSE CAST(TRY_CAST(fca.min_value AS BIGINT) AS VARCHAR)
+                                END
+                            ELSE fca.min_value
+                        END AS transformed_min,
+                        CASE
+                            WHEN fca.max_value IS NULL THEN NULL
+                            WHEN contains(lower(fca.column_type), 'timestamp') THEN
+                                regexp_replace(
+                                    regexp_replace(replace(fca.max_value, ' ', 'T'), '[+-]\\d{2}(?::\\d{2})?$', ''),
+                                    '^([^.]+)$', '\\1.000'
+                                ) || 'Z'
+                            WHEN contains(lower(fca.column_type), 'date') THEN fca.max_value
+                            WHEN contains(lower(fca.column_type), 'bool') THEN CAST(lower(fca.max_value) IN ('true', 't', '1', 'yes') AS VARCHAR)
+                            WHEN contains(lower(fca.column_type), 'int') OR contains(lower(fca.column_type), 'float')
+                                 OR contains(lower(fca.column_type), 'double') OR contains(lower(fca.column_type), 'decimal') THEN
+                                CASE WHEN contains(fca.max_value, '.') OR contains(lower(fca.max_value), 'e')
+                                     THEN CAST(TRY_CAST(fca.max_value AS DOUBLE) AS VARCHAR)
+                                     ELSE CAST(TRY_CAST(fca.max_value AS BIGINT) AS VARCHAR)
+                                END
+                            ELSE fca.max_value
+                        END AS transformed_max
+                    FROM file_column_stats_agg fca
+                ),
+                file_metadata AS (
+                    SELECT
+                        ts.table_id,
+                        ts.table_name,
+                        ts.snapshot_id,
+                        ts.table_root,
+                        ts.schema_fields,
+                        df.data_file_id,
+                        df.path AS file_path,
+                        df.file_size_bytes,
+                        COALESCE(MAX(fct.value_count), 0) AS num_records,
+                        COALESCE(map_from_entries(list({
+                            'key': fct.column_name,
+                            'value': fct.transformed_min
+                        } ORDER BY fct.column_name) FILTER (WHERE fct.column_name IS NOT NULL AND fct.transformed_min IS NOT NULL)), MAP{}::MAP(VARCHAR, VARCHAR)) AS min_values,
+                        COALESCE(map_from_entries(list({
+                            'key': fct.column_name,
+                            'value': fct.transformed_max
+                        } ORDER BY fct.column_name) FILTER (WHERE fct.column_name IS NOT NULL AND fct.transformed_max IS NOT NULL)), MAP{}::MAP(VARCHAR, VARCHAR)) AS max_values,
+                        COALESCE(map_from_entries(list({
+                            'key': fct.column_name,
+                            'value': fct.null_count
+                        } ORDER BY fct.column_name) FILTER (WHERE fct.column_name IS NOT NULL AND fct.null_count IS NOT NULL)), MAP{}::MAP(VARCHAR, BIGINT)) AS null_count
+                    FROM table_schemas ts
+                    JOIN ducklake_data_file df ON df.table_id = ts.table_id
+                    LEFT JOIN file_column_stats_transformed fct ON df.data_file_id = fct.data_file_id
+                    WHERE df.end_snapshot IS NULL
+                    GROUP BY ts.table_id, ts.table_name, ts.snapshot_id,
+                             ts.table_root, ts.schema_fields, df.data_file_id, df.path, df.file_size_bytes
+                ),
+                table_aggregates AS (
+                    SELECT
+                        table_id,
+                        table_name,
+                        snapshot_id,
+                        table_root,
+                        schema_fields,
+                        COUNT(*) AS num_files,
+                        SUM(num_records) AS total_rows,
+                        SUM(file_size_bytes) AS total_bytes,
+                        list({
+                            'path': ltrim(file_path, '/'),
+                            'partitionValues': MAP{}::MAP(VARCHAR, VARCHAR),
+                            'size': file_size_bytes,
+                            'modificationTime': epoch_ms(now()),
+                            'dataChange': true,
+                            'stats': COALESCE(to_json({
+                                'numRecords': COALESCE(num_records, 0),
+                                'minValues': COALESCE(min_values, MAP{}::MAP(VARCHAR, VARCHAR)),
+                                'maxValues': COALESCE(max_values, MAP{}::MAP(VARCHAR, VARCHAR)),
+                                'nullCount': COALESCE(null_count, MAP{}::MAP(VARCHAR, BIGINT))
+                            }), '{"numRecords":0}'),
+                            'tags': MAP{}::MAP(VARCHAR, VARCHAR)
+                        }::STRUCT(
+                            path VARCHAR,
+                            partitionValues MAP(VARCHAR, VARCHAR),
+                            size BIGINT,
+                            modificationTime BIGINT,
+                            dataChange BOOLEAN,
+                            stats VARCHAR,
+                            tags MAP(VARCHAR, VARCHAR)
+                        )) AS add_entries
+                    FROM file_metadata
+                    GROUP BY table_id, table_name, snapshot_id, table_root, schema_fields
+                ),
+                checkpoint_data AS (
+                    SELECT
+                        ta.*,
+                        epoch_ms(now()) AS now_ms,
+                        uuid()::VARCHAR AS txn_id,
+                        (substring(md5(ta.table_id::VARCHAR || '-metadata'), 1, 8) || '-' ||
+                         substring(md5(ta.table_id::VARCHAR || '-metadata'), 9, 4) || '-' ||
+                         substring(md5(ta.table_id::VARCHAR || '-metadata'), 13, 4) || '-' ||
+                         substring(md5(ta.table_id::VARCHAR || '-metadata'), 17, 4) || '-' ||
+                         substring(md5(ta.table_id::VARCHAR || '-metadata'), 21, 12)) AS meta_id,
+                        to_json({'type': 'struct', 'fields': ta.schema_fields}) AS schema_string
+                    FROM table_aggregates ta
+                ),
+                checkpoint_parquet_data AS (
+                    SELECT
+                        cd.table_id,
+                        cd.table_name,
+                        cd.snapshot_id,
+                        cd.table_root,
+                        cd.meta_id,
+                        cd.now_ms,
+                        cd.txn_id,
+                        cd.schema_string,
+                        cd.num_files,
+                        cd.total_rows,
+                        cd.total_bytes,
+                        {'minReaderVersion': 1, 'minWriterVersion': 2} AS protocol,
+                        NULL AS metaData,
+                        NULL AS add,
+                        NULL::STRUCT(path VARCHAR, deletionTimestamp BIGINT, dataChange BOOLEAN) AS remove,
+                        NULL::STRUCT(timestamp TIMESTAMP, operation VARCHAR, operationParameters MAP(VARCHAR, VARCHAR), isolationLevel VARCHAR, isBlindAppend BOOLEAN, operationMetrics MAP(VARCHAR, VARCHAR), engineInfo VARCHAR, txnId VARCHAR) AS commitInfo,
+                        1 AS row_order
+                    FROM checkpoint_data cd
+                    UNION ALL
+                    SELECT
+                        cd.table_id,
+                        cd.table_name,
+                        cd.snapshot_id,
+                        cd.table_root,
+                        cd.meta_id,
+                        cd.now_ms,
+                        cd.txn_id,
+                        cd.schema_string,
+                        cd.num_files,
+                        cd.total_rows,
+                        cd.total_bytes,
+                        NULL AS protocol,
+                        {
+                            'id': cd.meta_id,
+                            'name': cd.table_name,
+                            'format': {'provider': 'parquet', 'options': MAP{}::MAP(VARCHAR, VARCHAR)}::STRUCT(provider VARCHAR, options MAP(VARCHAR, VARCHAR)),
+                            'schemaString': cd.schema_string,
+                            'partitionColumns': []::VARCHAR[],
+                            'createdTime': cd.now_ms,
+                            'configuration': MAP{}::MAP(VARCHAR, VARCHAR)
+                        }::STRUCT(id VARCHAR, name VARCHAR, format STRUCT(provider VARCHAR, options MAP(VARCHAR, VARCHAR)), schemaString VARCHAR, partitionColumns VARCHAR[], createdTime BIGINT, configuration MAP(VARCHAR, VARCHAR)) AS metaData,
+                        NULL AS add,
+                        NULL::STRUCT(path VARCHAR, deletionTimestamp BIGINT, dataChange BOOLEAN) AS remove,
+                        NULL::STRUCT(timestamp TIMESTAMP, operation VARCHAR, operationParameters MAP(VARCHAR, VARCHAR), isolationLevel VARCHAR, isBlindAppend BOOLEAN, operationMetrics MAP(VARCHAR, VARCHAR), engineInfo VARCHAR, txnId VARCHAR) AS commitInfo,
+                        2 AS row_order
+                    FROM checkpoint_data cd
+                    UNION ALL
+                    SELECT
+                        cd.table_id,
+                        cd.table_name,
+                        cd.snapshot_id,
+                        cd.table_root,
+                        cd.meta_id,
+                        cd.now_ms,
+                        cd.txn_id,
+                        cd.schema_string,
+                        cd.num_files,
+                        cd.total_rows,
+                        cd.total_bytes,
+                        NULL AS protocol,
+                        NULL AS metaData,
+                        unnest(cd.add_entries) AS add,
+                        NULL::STRUCT(path VARCHAR, deletionTimestamp BIGINT, dataChange BOOLEAN) AS remove,
+                        NULL::STRUCT(timestamp TIMESTAMP, operation VARCHAR, operationParameters MAP(VARCHAR, VARCHAR), isolationLevel VARCHAR, isBlindAppend BOOLEAN, operationMetrics MAP(VARCHAR, VARCHAR), engineInfo VARCHAR, txnId VARCHAR) AS commitInfo,
+                        3 AS row_order
+                    FROM checkpoint_data cd
+                )
+                SELECT * FROM checkpoint_parquet_data
+            """, [table_id, table_name, snapshot_id, table_root, table_id, table_id])
+
+            # Build JSON log content
+            con.execute("""
+                CREATE OR REPLACE TEMP TABLE temp_checkpoint_json AS
+                SELECT DISTINCT
+                    p.table_id,
+                    p.table_root,
+                    p.snapshot_id,
+                    p.num_files,
+                    to_json({
+                        'commitInfo': {
+                            'timestamp': p.now_ms,
+                            'operation': 'CONVERT',
+                            'operationParameters': {
+                                'convertedFrom': 'DuckLake',
+                                'duckLakeSnapshotId': p.snapshot_id::VARCHAR,
+                                'partitionBy': '[]'
+                            },
+                            'isolationLevel': 'Serializable',
+                            'isBlindAppend': false,
+                            'operationMetrics': {
+                                'numFiles': p.num_files::VARCHAR,
+                                'numOutputRows': p.total_rows::VARCHAR,
+                                'numOutputBytes': p.total_bytes::VARCHAR
+                            },
+                            'engineInfo': 'DuckLake-Delta-Exporter/1.0.0',
+                            'txnId': p.txn_id
+                        }
+                    }) || chr(10) ||
+                    to_json({
+                        'metaData': {
+                            'id': p.meta_id,
+                            'name': p.table_name,
+                            'format': {'provider': 'parquet', 'options': MAP{}},
+                            'schemaString': p.schema_string::VARCHAR,
+                            'partitionColumns': [],
+                            'createdTime': p.now_ms,
+                            'configuration': MAP{}
+                        }
+                    }) || chr(10) ||
+                    to_json({
+                        'protocol': {'minReaderVersion': 1, 'minWriterVersion': 2}
+                    }) AS content
+                FROM temp_checkpoint_parquet p
+                WHERE p.row_order = 1
+            """)
+
+            # Build last checkpoint content
+            con.execute("""
+                CREATE OR REPLACE TEMP TABLE temp_last_checkpoint AS
+                SELECT
+                    table_id,
+                    table_root,
+                    snapshot_id,
+                    '{"version":' || snapshot_id || ',"size":' || (2 + num_files) || '}' AS content
+                FROM temp_checkpoint_parquet
+                WHERE row_order = 1
+            """)
+
+            # Get file paths
+            paths = con.execute("""
+                SELECT
+                    table_root || '/_delta_log/' || lpad(snapshot_id::VARCHAR, 20, '0') || '.checkpoint.parquet' AS checkpoint_file,
+                    table_root || '/_delta_log/' || lpad(snapshot_id::VARCHAR, 20, '0') || '.json' AS json_file,
+                    table_root || '/_delta_log/_last_checkpoint' AS last_checkpoint_file,
+                    table_root || '/_delta_log' AS delta_log_path
+                FROM temp_checkpoint_parquet
+                WHERE row_order = 1
+                LIMIT 1
+            """).fetchone()
+
+            checkpoint_file, json_file, last_checkpoint_file, delta_log_path = paths
+
+            # Create delta_log directory for local paths
+            if not any(table_root.startswith(prefix) for prefix in ['abfss://', 's3://', 'gs://', 'az://', 'http://', 'https://']):
+                con.execute(f"""
+                    COPY (SELECT 1 AS id, 1 AS ".duckdb_init")
+                    TO '{delta_log_path}'
+                    (FORMAT CSV, PARTITION_BY (".duckdb_init"), OVERWRITE_OR_IGNORE)
+                """)
+
+            # Write checkpoint parquet
+            con.execute(f"""
+                COPY (SELECT protocol, metaData, add, remove, commitInfo
+                      FROM temp_checkpoint_parquet ORDER BY row_order)
+                TO '{checkpoint_file}' (FORMAT PARQUET)
+            """)
+
+            # Write JSON log
+            con.execute(f"""
+                COPY (SELECT content FROM temp_checkpoint_json)
+                TO '{json_file}' (FORMAT CSV, HEADER false, QUOTE '')
+            """)
+
+            # Write last checkpoint
+            con.execute(f"""
+                COPY (SELECT content FROM temp_last_checkpoint)
+                TO '{last_checkpoint_file}' (FORMAT CSV, HEADER false, QUOTE '')
+            """)
+
+            print(f"  ✅ {table_key}: exported snapshot {snapshot_id} ({file_count} files)")
+
         except Exception as e:
-            print(f"❌ {table_key}: Failed to export checkpoint - {e}")
-    
+            print(f"  ❌ {table_key}: {e}")
+
+    # Cleanup temp tables
+    con.execute("DROP TABLE IF EXISTS export_summary")
+    con.execute("DROP TABLE IF EXISTS temp_checkpoint_parquet")
+    con.execute("DROP TABLE IF EXISTS temp_checkpoint_json")
+    con.execute("DROP TABLE IF EXISTS temp_last_checkpoint")
+
     con.close()
-    print(f"\n🎉 Export completed! {successful_exports}/{total_tables} tables exported successfully.")
+    print("\n🎉 Export completed!")

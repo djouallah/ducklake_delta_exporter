@@ -1,2 +1,2 @@
 # File: requirements.txt
-duckdb
+duckdb>=1.4.4

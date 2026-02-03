@@ -3,9 +3,9 @@ from setuptools import setup, find_packages
 
 setup(
     name='ducklake-delta-exporter',
-    version='0.1.4',
+    version='0.3.0',
     packages=find_packages(),
-    install_requires=['duckdb'],
+    install_requires=['duckdb>=1.4.4'],
     author='mim',
     author_email='your.email@example.com',
     description='A utility to export DuckLake database metadata to Delta Lake transaction logs.',

@@ -6,6 +6,13 @@ __pycache__/
 # Distribution / packaging
 dist/
 build/
+%Syst*/
+
+# Test data files (keep test_*.py)
+tests/*.sql
+tests/*.db
+tests/*.ipynb
+tests/nul
 *.egg-info/
 *.egg
 
@@ -27,3 +34,6 @@ env/
 # OS files
 .DS_Store
 Thumbs.db
+
+#claude
+.claude
